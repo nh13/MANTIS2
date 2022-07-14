@@ -1,4 +1,6 @@
-MANTIS
+**This is a fork of https://github.com/OSU-SRLab/MANTIS as the latter is no longer being maintained**
+
+MANTIS2
 ============
 
 MANTIS (Microsatellite Analysis for Normal-Tumor InStability) is a
