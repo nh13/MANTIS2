@@ -22,11 +22,12 @@ clap = { version = "3.2.5", features = ["derive"] }
 env_logger = "0.9.0"
 lazy_static = "1.4.0"
 log = "0.4.17"
+noodles = { version = "0.25.0", features = ["bed", "core", "fasta"] }
 
 [build-dependencies]
 built = { version = "0.5.1", features = ["git2"] }
 
 [dev-dependencies]
 matches = "0.1.9"
-rstest = "0.12.0"
+rstest = "0.13.0"
 tempfile = "3.2.0"
