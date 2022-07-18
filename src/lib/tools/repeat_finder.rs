@@ -52,7 +52,7 @@ pub struct Opts {
 #[allow(clippy::too_many_lines)]
 pub fn run(opts: &Opts) -> Result<(), anyhow::Error> {
     // Build the finders
-    let mut finders: Vec<KmerFinder> = Vec::new();
+    let mut finders: Vec<KmerFinder> = Vec::with_capacity(opts.max_repeat_length - opts.min_repeat_length + 1);
     let mut i = opts.min_repeat_length;
     while i <= opts.max_repeat_length {
         finders.push(KmerFinder::new(i));
