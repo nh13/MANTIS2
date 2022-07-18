@@ -1,13 +1,10 @@
-use std::{
-    fs::File,
-    io::{BufReader, BufWriter},
-    path::PathBuf,
-    str::FromStr,
-};
+use std::{path::PathBuf, str::FromStr};
 
+use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 use env_logger::Env;
+use fgoxide::io::Io;
 
 use crate::utils::built_info;
 use noodles::bed;
@@ -52,7 +49,8 @@ pub struct Opts {
 #[allow(clippy::too_many_lines)]
 pub fn run(opts: &Opts) -> Result<(), anyhow::Error> {
     // Build the finders
-    let mut finders: Vec<KmerFinder> = Vec::with_capacity(opts.max_repeat_length - opts.min_repeat_length + 1);
+    let mut finders: Vec<KmerFinder> =
+        Vec::with_capacity(opts.max_repeat_length - opts.min_repeat_length + 1);
     let mut i = opts.min_repeat_length;
     while i <= opts.max_repeat_length {
         finders.push(KmerFinder::new(i));
@@ -60,12 +58,21 @@ pub fn run(opts: &Opts) -> Result<(), anyhow::Error> {
     }
 
     // Open the input and output
-    let mut reader = File::open(&opts.input).map(BufReader::new).map(fasta::Reader::new)?;
-    let mut writer = File::create(&opts.output).map(BufWriter::new).map(bed::Writer::new)?;
+    let io = Io::default();
+
+    let mut reader = io
+        .new_reader(&opts.input)
+        .map(fasta::Reader::new)
+        .with_context(|| format!("Could not open FASTA for reading: {:?}", opts.input))?;
+    let mut writer = io
+        .new_writer(&opts.output)
+        .map(bed::Writer::new)
+        .with_context(|| format!("Could not open BED for writing: {:?}", opts.output))?;
 
     // Go through each contig, one at a time
-    for result in reader.records() {
-        let record = result?;
+    for (index, result) in reader.records().enumerate() {
+        let record =
+            result.with_context(|| format!("Could not parse the {}th FASTA record", index + 1))?;
         let contig = record.name();
 
         for finder in &mut finders {
@@ -75,8 +82,14 @@ pub fn run(opts: &Opts) -> Result<(), anyhow::Error> {
         // Go through each base, one at a time
         let mut i = 1;
         while i <= record.sequence().len() {
-            let position = Position::try_from(i)?;
-            let base: u8 = record.sequence().get(position).unwrap() & 0xdf; // to upper case
+            let position = Position::try_from(i)
+                .with_context(|| format!("Could not create a Position from {}", i))?;
+            let base: u8 = record
+                .sequence()
+                .get(position)
+                .with_context(|| format!("Could not retrieve base at {}:{}", record.name(), i))
+                .unwrap()
+                & 0xdf; // to upper case
 
             // Output the smallest repeat found ending at this position.
             let mut found = false;
@@ -85,7 +98,10 @@ pub fn run(opts: &Opts) -> Result<(), anyhow::Error> {
                     if found {
                         continue;
                     } else if let Some(rec) = to_bed_record(opts, contig, i, finder, &repeat) {
-                        writer.write_record(&rec).unwrap();
+                        writer
+                            .write_record(&rec)
+                            .with_context(|| format!("Could not write BED record {:?}", rec))
+                            .unwrap();
                         found = true;
                     }
                 }
@@ -98,7 +114,10 @@ pub fn run(opts: &Opts) -> Result<(), anyhow::Error> {
             if let Some(repeat) = finder.emit() {
                 // only output the first repeat found at this position
                 if let Some(rec) = to_bed_record(opts, contig, i, finder, &repeat) {
-                    writer.write_record(&rec).unwrap();
+                    writer
+                        .write_record(&rec)
+                        .with_context(|| format!("Could not write BED record {:?}", rec))
+                        .unwrap();
                     break;
                 }
             }
@@ -126,14 +145,29 @@ fn to_bed_record(
     } else {
         let unit = String::from_utf8_lossy(&repeat.kmer);
         let name = format!("({}){:?}", unit, repeat.span / finder.len());
-        let start_position = Position::try_from(position - repeat.span).unwrap();
-        let end_position = Position::try_from(position - 1).unwrap();
+        let start_position = Position::try_from(position - repeat.span)
+            .with_context(|| {
+                format!("Could not create BED start Position: {}", position - repeat.span)
+            })
+            .unwrap();
+        let end_position = Position::try_from(position - 1)
+            .with_context(|| format!("Could not create BED end Position: {}", position - 1))
+            .unwrap();
+        let name = bed::record::Name::from_str(&name)
+            .with_context(|| format!("Could not create BED name: {}", name))
+            .unwrap();
         let bed_record = bed::Record::<4>::builder()
             .set_reference_sequence_name(contig)
             .set_start_position(start_position)
             .set_end_position(end_position)
-            .set_name(bed::record::Name::from_str(&name).unwrap())
+            .set_name(name)
             .build()
+            .with_context(|| {
+                format!(
+                    "Could not build a BED record at {}:{} for repeat {:?}",
+                    contig, position, repeat
+                )
+            })
             .unwrap();
         Some(bed_record)
     }
