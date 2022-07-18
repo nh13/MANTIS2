@@ -80,24 +80,17 @@ pub fn run(opts: &Opts) -> Result<(), anyhow::Error> {
         }
 
         // Go through each base, one at a time
-        let mut i = 1;
-        while i <= record.sequence().len() {
-            let position = Position::try_from(i)
-                .with_context(|| format!("Could not create a Position from {}", i))?;
-            let base: u8 = record
-                .sequence()
-                .get(position)
-                .with_context(|| format!("Could not retrieve base at {}:{}", record.name(), i))
-                .unwrap()
-                & 0xdf; // to upper case
-
+        let bases = record.sequence().as_ref();
+        for (index, base) in bases.iter().enumerate() {
+            let position = index + 1;
             // Output the smallest repeat found ending at this position.
             let mut found = false;
             for finder in &mut finders {
-                if let Some(repeat) = finder.add_maybe_emit(base, !found) {
+                if let Some(repeat) = finder.add_maybe_emit(*base & 0xdf, !found) {
                     if found {
                         continue;
-                    } else if let Some(rec) = to_bed_record(opts, contig, i, finder, &repeat) {
+                    } else if let Some(rec) = to_bed_record(opts, contig, position, finder, &repeat)
+                    {
                         writer
                             .write_record(&rec)
                             .with_context(|| format!("Could not write BED record {:?}", rec))
@@ -106,7 +99,6 @@ pub fn run(opts: &Opts) -> Result<(), anyhow::Error> {
                     }
                 }
             }
-            i += 1;
         }
 
         // Emit any repeat that goes to the end of the contig

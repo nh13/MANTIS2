@@ -7,6 +7,9 @@ use log::error;
 use mantis_msi2_lib::tools::detect::{run as extract, Opts as DetectOps};
 use mantis_msi2_lib::tools::repeat_finder::{run as index, Opts as RepeatFinderOpts};
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
 #[clap(propagate_version = true)]
