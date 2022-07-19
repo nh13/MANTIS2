@@ -7,6 +7,7 @@
 )]
 pub mod tools {
     pub mod detect;
+    pub mod repeat_counter;
     pub mod repeat_finder;
 }
 pub mod utils;

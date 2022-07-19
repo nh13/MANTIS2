@@ -59,7 +59,6 @@ pub fn run(opts: &Opts) -> Result<(), anyhow::Error> {
 
     // Open the input and output
     let io = Io::default();
-
     let mut reader = io
         .new_reader(&opts.input)
         .map(fasta::Reader::new)
