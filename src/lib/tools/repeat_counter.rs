@@ -1,4 +1,7 @@
+use log::{debug, info};
+use std::collections::HashMap;
 use std::fs::File;
+use std::thread::JoinHandle;
 use std::{path::PathBuf, str::FromStr};
 
 use anyhow::Context;
@@ -6,6 +9,7 @@ use anyhow::Result;
 use clap::Parser;
 use env_logger::Env;
 use fgoxide::io::Io;
+use noodles::bam::bai::Index;
 
 use crate::utils::built_info;
 use noodles::bam;
@@ -20,16 +24,17 @@ use flume::{bounded, unbounded, Receiver, Sender};
 use noodles::core::Position;
 
 /// Counts repeats in your BAM given a BED of repeats
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[clap(name = "repeat-finder", verbatim_doc_comment, version = built_info::VERSION.as_str())]
 pub struct Opts {
     /// The input BAM for the normal sample
     #[clap(short = 'n', long, display_order = 1)]
     pub normal: PathBuf,
 
-    // /// The input BAM for the tumor sample
-    // #[clap(short = 't', long, display_order = 2)]
-    // pub tumor: PathBuf,
+    /// The input BAM for the tumor sample
+    #[clap(short = 't', long, display_order = 2)]
+    pub tumor: PathBuf,
+
     /// The input BED file with MSI loci
     #[clap(short = 'b', long, display_order = 3)]
     pub bedfile: PathBuf,
@@ -59,10 +64,10 @@ pub struct Opts {
     // // pub min_read_length: u64,
     /// The number of threads to use
     #[clap(long, default_value = "1", display_order = 3)]
-    pub threads: u64,
+    pub threads: usize,
 }
 
-struct BamRecordJob {
+struct WorkerJob {
     locus: bed::Record<4>,
     record: sam::alignment::Record,
     is_normal: bool,
@@ -85,10 +90,9 @@ fn query_reads(
     is_normal: bool,
     bed_record: &bed::Record<4>,
     region: &noodles_core::Region,
-    bam_record_job_tx: &Sender<BamRecordJob>,
+    bam_record_job_tx: &Sender<WorkerJob>,
 ) {
     let name = if is_normal { "normal" } else { "tumor" };
-
     let query = bam_reader
         .query(bam_header.reference_sequences(), bam_index, &region)
         .with_context(|| format!("Could not query {} BAM for region: {:?}", name, region))
@@ -102,87 +106,221 @@ fn query_reads(
             && bam_record.alignment_start().unwrap() <= bed_record.start_position()
             && bed_record.end_position() <= bam_record.alignment_end().unwrap()
         {
-            let job = BamRecordJob { locus: bed_record.clone(), record: bam_record, is_normal };
+            let job = WorkerJob { locus: bed_record.clone(), record: bam_record, is_normal };
             bam_record_job_tx.send(job).with_context(|| "Could not send BamRecordJob").unwrap();
         }
     }
 }
 
-/// Convenience type for functions that return [`PoolError`].
-type JobResult<T> = Result<T, anyhow::Error>;
+type AnyhowResult<T> = Result<T, anyhow::Error>;
+
+struct CounterJob {
+    locus: bed::Record<4>,
+    count: usize,
+    is_normal: bool,
+}
+
+struct BamQueryJob {
+    locus: bed::Record<4>,
+    bam: PathBuf,
+    bai: bam::bai::Index,
+    header: sam::Header,
+    is_normal: bool,
+}
+
+struct BaiAndHeader {
+    bai: bam::bai::Index,
+    header: sam::Header,
+}
+
+impl BaiAndHeader {
+    fn new(io: &Io, path: &PathBuf, is_normal: bool) -> BaiAndHeader {
+        let name = if is_normal { "normal" } else { "tumor" };
+        let mut reader = File::open(path)
+            .map(bam::Reader::new)
+            .with_context(|| format!("Could not open {} BAM for reading: {:?}", name, path))
+            .unwrap();
+        let bai = get_index(&path).unwrap();
+        let header: sam::Header = reader.read_header().unwrap().parse().unwrap();
+        BaiAndHeader { bai, header }
+    }
+}
 
 // Run extract
 #[allow(clippy::too_many_lines)]
 pub fn run(opts: &Opts) -> Result<(), anyhow::Error> {
-    // Open the input and output
+    let (bam_query_job_tx, bam_query_job_rx): (Sender<BamQueryJob>, Receiver<BamQueryJob>) =
+        flume::bounded(opts.threads * 8);
+
+    let (worker_job_tx, worker_job_rx): (Sender<WorkerJob>, Receiver<WorkerJob>) =
+        flume::bounded(opts.threads * 1024 * 1024);
+
+    let (counter_job_tx, counter_job_rx): (Sender<CounterJob>, Receiver<CounterJob>) =
+        flume::bounded(opts.threads * 1024 * 1024);
+
+    let counter_handle = std::thread::spawn(move || {
+        let mut key_to_locus: HashMap<String, bed::Record<4>> = HashMap::new();
+        let mut counter: HashMap<String, HashMap<usize, HashMap<bool, usize>>> = HashMap::new();
+        while let Ok(count_job) = counter_job_rx.recv() {
+            // Add to the key -> locus map
+            let locus_key = count_job.locus.to_string();
+            key_to_locus.entry(locus_key.clone()).or_insert(count_job.locus);
+
+            // Get the map from repeat count to T/N count map
+            let repeat = counter.entry(locus_key).or_insert_with(HashMap::new);
+
+            // Get the map from is_normal to count
+            let repeat_count = repeat.entry(count_job.count).or_insert_with(HashMap::new);
+
+            // Increment the count for the repeat count at the given locus
+            *repeat_count.entry(count_job.is_normal).or_insert(0) += 1;
+        }
+        for (key, repeat) in &counter {
+            let locus = match key_to_locus.get(key) {
+                Some(l) => l,
+                None => panic!("Bug: locus not found {}", key),
+            };
+
+            for (length, repeat_count) in repeat.iter() {
+                let normal_count = repeat_count.get(&true).unwrap_or(&0);
+                let tumor_count = repeat_count.get(&false).unwrap_or(&0);
+                println!(
+                    "{}:{}-{}\t{}\t{}\t{}",
+                    locus.reference_sequence_name(),
+                    locus.start_position(),
+                    locus.end_position(),
+                    length,
+                    normal_count,
+                    tumor_count
+                );
+            }
+        }
+    });
+
+    let worker_handles: Vec<std::thread::JoinHandle<AnyhowResult<()>>> = (0..opts.threads)
+        .map(|_i| {
+            let rx = worker_job_rx.clone();
+            let tx = counter_job_tx.clone();
+            std::thread::spawn(move || {
+                while let Ok(worker_job) = rx.recv() {
+                    let count_job = CounterJob {
+                        locus: worker_job.locus,
+                        count: 0,
+                        is_normal: worker_job.is_normal,
+                    };
+                    tx.send(count_job).unwrap();
+                }
+                drop(tx);
+                Ok(())
+            })
+        })
+        // Collect is needed to force the evaluation of the closure and start the loops
+        .collect();
+
+    let bam_query_handles: Vec<std::thread::JoinHandle<AnyhowResult<()>>> = (0..opts.threads)
+        .map(|_i| {
+            let rx = bam_query_job_rx.clone();
+            let tx = worker_job_tx.clone();
+            std::thread::spawn(move || {
+                while let Ok(bam_query_job) = rx.recv() {
+                    let name = if bam_query_job.is_normal { "normal" } else { "tumor" };
+                    let locus = bam_query_job.locus;
+                    let region = noodles_core::Region::new(
+                        locus.reference_sequence_name(),
+                        locus.start_position()..=locus.end_position(),
+                    );
+
+                    let mut reader = File::open(&bam_query_job.bam)
+                        .map(bam::Reader::new)
+                        .with_context(|| {
+                            format!(
+                                "Could not open {} BAM for reading: {:?}",
+                                name, bam_query_job.bam
+                            )
+                        })
+                        .unwrap();
+
+                    query_reads(
+                        &bam_query_job.header,
+                        &mut reader,
+                        &bam_query_job.bai,
+                        bam_query_job.is_normal,
+                        &locus,
+                        &region,
+                        &tx,
+                    );
+                }
+                drop(tx);
+                Ok(())
+            })
+        })
+        // Collect is needed to force the evaluation of the closure and start the loops
+        .collect();
+
+    // Read in the BED, and send jobs to query the BAM
     let io = Io::default();
     let mut bed_reader = io
         .new_reader(&opts.bedfile)
         .map(bed::Reader::new)
-        .with_context(|| format!("Could not open BED for reading: {:?}", opts.bedfile))?;
-    let mut normal_bam_reader = File::open(&opts.normal)
-        .map(bam::Reader::new)
-        .with_context(|| format!("Could not open normal BAM for reading: {:?}", opts.normal))?;
-    // let mut tumor_bam_reader = File::open(&opts.tumor)
-    //     .map(bam::Reader::new)
-    //     .with_context(|| format!("Could not open tumor BAM for reading: {:?}", opts.tumor))?;
+        .with_context(|| format!("Could not open BED for reading: {:?}", opts.bedfile))
+        .unwrap();
+    let normal_bai_and_header = BaiAndHeader::new(&io, &opts.normal, true);
+    let tumor_bai_and_header = BaiAndHeader::new(&io, &&opts.tumor, false);
 
-    // Read the BAM indexes
-    let normal_bai = get_index(&opts.normal)?;
-    // let tumor_bai = get_index(&opts.tumor)?;
-
-    // Read the SAM headers
-    let normal_bam_header: sam::Header = normal_bam_reader.read_header()?.parse()?;
-    // let tumor_bam_header: sam::Header = tumor_bam_reader.read_header()?.parse()?;
-
-    let (bam_record_job_tx, bam_record_job_rx): (Sender<BamRecordJob>, Receiver<BamRecordJob>) =
-        flume::unbounded();
-
-    let workers: Vec<std::thread::JoinHandle<JobResult<()>>> = (0..opts.threads)
-        .map(|_i| {
-            let rx = bam_record_job_rx.clone();
-            std::thread::spawn(move || {
-                while let Ok(job) = rx.recv() {
-                    // TODO
-                    println!(
-                        "record: {:?}",
-                        String::from_utf8_lossy(job.record.read_name().unwrap().as_ref())
-                    );
-                }
-                Ok(())
-            })
-        })
-        .collect();
-
-    // Iterate loci by loci
     for (index, bed_result) in bed_reader.records::<4>().enumerate() {
-        let bed_record = bed_result
-            .with_context(|| format!("Could not parse the {}th BED record", index + 1))?;
+        let locus = bed_result
+            .with_context(|| format!("Could not parse the {}th BED record", index + 1))
+            .unwrap();
 
-        let region = noodles_core::Region::new(
-            bed_record.reference_sequence_name(),
-            bed_record.start_position()..=bed_record.end_position(),
-        );
+        if (index + 1) % 1000 == 0 {
+            info!(
+                "Processed {} loci; last: {}:{}-{}",
+                index + 1,
+                locus.reference_sequence_name(),
+                locus.start_position(),
+                locus.end_position()
+            );
+        }
 
-        query_reads(
-            &normal_bam_header,
-            &mut normal_bam_reader,
-            &normal_bai,
-            true,
-            &bed_record,
-            &region,
-            &bam_record_job_tx,
-        );
-        // query_reads(
-        //     &tumor_bam_header,
-        //     &mut tumor_bam_reader,
-        //     &tumor_bai,
-        //     true,
-        //     &bed_record,
-        //     &region,
-        //     &bam_record_job_tx,
-        // );
+        let normal_job = BamQueryJob {
+            locus: locus.clone(),
+            bam: opts.normal.clone(),
+            bai: normal_bai_and_header.bai.clone(),
+            header: normal_bai_and_header.header.clone(),
+            is_normal: true,
+        };
+        let tumor_job = BamQueryJob {
+            locus: locus.clone(),
+            bam: opts.tumor.clone(),
+            bai: tumor_bai_and_header.bai.clone(),
+            header: tumor_bai_and_header.header.clone(),
+            is_normal: false,
+        };
+
+        bam_query_job_tx.send(normal_job)?;
+        bam_query_job_tx.send(tumor_job)?;
     }
+    drop(bam_query_job_tx);
+
+    // Close the worker handles
+    bam_query_handles.into_iter().try_for_each(|handle| match handle.join() {
+        Ok(result) => result,
+        Err(e) => std::panic::resume_unwind(e),
+    })?;
+    drop(worker_job_tx);
+
+    // Close the worker handles
+    worker_handles.into_iter().try_for_each(|handle| match handle.join() {
+        Ok(result) => result,
+        Err(e) => std::panic::resume_unwind(e),
+    })?;
+    drop(counter_job_tx);
+
+    // Close the counter handle
+    match counter_handle.join() {
+        Ok(result) => result,
+        Err(e) => std::panic::resume_unwind(e),
+    };
 
     Ok(())
 }
