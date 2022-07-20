@@ -1,6 +1,8 @@
 use log::{debug, info};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::File;
+use std::hash::Hash;
 use std::thread::JoinHandle;
 use std::{path::PathBuf, str::FromStr};
 
@@ -39,9 +41,9 @@ pub struct Opts {
     #[clap(short = 'b', long, display_order = 3)]
     pub bedfile: PathBuf,
 
-    // /// The input reference genome FASTA
-    // #[clap(short = 'g', long, display_order = 4)]
-    // pub genome: PathBuf,
+    /// The input reference genome FASTA
+    #[clap(short = 'g', long, display_order = 4)]
+    pub genome: PathBuf,
 
     // // /// The path to the output
     // // #[clap(short = 'o', long, display_order = 5)]
@@ -146,6 +148,19 @@ impl BaiAndHeader {
     }
 }
 
+fn build_contig_to_offset(fasta: &PathBuf) -> HashMap<String, u64> {
+    let fai_path: PathBuf = {
+        let mut os_string = OsString::from(fasta);
+        os_string.push(".");
+        os_string.push("fai");
+        PathBuf::from(os_string)
+    };
+    let fai = fasta::fai::read(fai_path.clone())
+        .with_context(|| format!("Could not open FASTA index: {:?}", fai_path))
+        .unwrap();
+    fai.iter().map(|rec| (rec.name().to_string(), rec.offset())).collect()
+}
+
 // Run extract
 #[allow(clippy::too_many_lines)]
 pub fn run(opts: &Opts) -> Result<(), anyhow::Error> {
@@ -158,7 +173,9 @@ pub fn run(opts: &Opts) -> Result<(), anyhow::Error> {
     let (counter_job_tx, counter_job_rx): (Sender<CounterJob>, Receiver<CounterJob>) =
         flume::bounded(opts.threads * 1024 * 1024);
 
+    let contig_to_offset = build_contig_to_offset(&opts.genome);
     let counter_handle = std::thread::spawn(move || {
+        info!("Computing counts by locus");
         let mut key_to_locus: HashMap<String, bed::Record<4>> = HashMap::new();
         let mut counter: HashMap<String, HashMap<usize, HashMap<bool, usize>>> = HashMap::new();
         while let Ok(count_job) = counter_job_rx.recv() {
@@ -175,13 +192,46 @@ pub fn run(opts: &Opts) -> Result<(), anyhow::Error> {
             // Increment the count for the repeat count at the given locus
             *repeat_count.entry(count_job.is_normal).or_insert(0) += 1;
         }
-        for (key, repeat) in &counter {
-            let locus = match key_to_locus.get(key) {
-                Some(l) => l,
+
+        info!("Collecting counts by locus");
+        let mut loci: Vec<(&String, &bed::Record<4>)> = counter
+            .keys()
+            .map(|key| {
+                let locus = match key_to_locus.get(key) {
+                    Some(l) => l,
+                    None => panic!("Bug: locus not found {}", key),
+                };
+                (key, locus)
+            })
+            .collect();
+
+        info!("Sorting counts by locus");
+        loci.sort_by_cached_key(|(key, locus)| {
+            let offset = match contig_to_offset.get(locus.reference_sequence_name()) {
+                Some(offset) => offset,
+                None => panic!(
+                    "Cannot find BED contig in FASTA index: {}",
+                    locus.reference_sequence_name()
+                ),
+            };
+            (offset, locus.start_position(), locus.end_position())
+        });
+
+        info!("Outputting counts by locus");
+        for (key, locus) in loci {
+            let repeat = match counter.get(key) {
+                Some(r) => r,
                 None => panic!("Bug: locus not found {}", key),
             };
 
-            for (length, repeat_count) in repeat.iter() {
+            let mut lengths: Vec<&usize> = repeat.keys().collect();
+            lengths.sort();
+
+            for length in lengths {
+                let repeat_count = match repeat.get(length) {
+                    Some(rc) => rc,
+                    None => panic!("Bug: Cannot find repeat length: {}", length),
+                };
                 let normal_count = repeat_count.get(&true).unwrap_or(&0);
                 let tumor_count = repeat_count.get(&false).unwrap_or(&0);
                 println!(
@@ -265,12 +315,19 @@ pub fn run(opts: &Opts) -> Result<(), anyhow::Error> {
         .with_context(|| format!("Could not open BED for reading: {:?}", opts.bedfile))
         .unwrap();
     let normal_bai_and_header = BaiAndHeader::new(&io, &opts.normal, true);
-    let tumor_bai_and_header = BaiAndHeader::new(&io, &&opts.tumor, false);
+    let tumor_bai_and_header = BaiAndHeader::new(&io, &opts.tumor, false);
 
+    let contig_to_offset = build_contig_to_offset(&opts.genome);
     for (index, bed_result) in bed_reader.records::<4>().enumerate() {
         let locus = bed_result
             .with_context(|| format!("Could not parse the {}th BED record", index + 1))
             .unwrap();
+
+        assert!(
+            contig_to_offset.get(locus.reference_sequence_name()) != None,
+            "Cannot find BED contig in FASTA index: {}",
+            locus.reference_sequence_name()
+        );
 
         if (index + 1) % 1000 == 0 {
             info!(
