@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use env_logger::Env;
 use log::error;
 use mantis_msi2_lib::tools::detect::{run as extract, Opts as DetectOps};
+use mantis_msi2_lib::tools::repeat_counter::{run as count, Opts as RepeatCounterOpts};
 use mantis_msi2_lib::tools::repeat_finder::{run as index, Opts as RepeatFinderOpts};
 
 #[global_allocator]
@@ -24,7 +25,9 @@ struct Cli {
 enum Commands {
     /// Detect microsatellite instability from a matched tumor-normal pair
     Detect(DetectOps),
-    //  Find repeats in your reference FASTA
+    /// Counts repeats in your BAM given a BED of repeats
+    RepeatCounter(RepeatCounterOpts),
+    /// Find repeats in your reference FASTA
     RepeatFinder(RepeatFinderOpts),
 }
 
@@ -40,6 +43,7 @@ fn main() {
 
     let result = match &cli.command {
         Commands::Detect(opts) => extract(opts),
+        Commands::RepeatCounter(opts) => count(opts),
         Commands::RepeatFinder(opts) => index(opts),
     };
 

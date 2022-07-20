@@ -20,7 +20,7 @@ pub struct Opts {
 
     /// The input BED file with MSI loci
     #[clap(short = 'b', long, display_order = 3)]
-    pub bedfile: u64,
+    pub bedfile: PathBuf,
 
     /// The input reference genome FASTA
     #[clap(short = 'g', long, display_order = 4)]
